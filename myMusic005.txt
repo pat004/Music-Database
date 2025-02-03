@@ -1,0 +1,711 @@
+-- Disable safe mode for the session (bypass workbench restrictions)
+SET SQL_SAFE_UPDATES = 0;
+SET GLOBAL log_bin_trust_function_creators = 1;
+
+
+-- Ensure stronger consistency/isolation
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+-- Drop the database if it exists and create a new one
+DROP DATABASE IF EXISTS `music`;
+CREATE DATABASE `music`;
+USE `music`;
+
+-- `log_table` to store procedure logs and errors
+CREATE TABLE `log_table` (
+    `log_id` INT AUTO_INCREMENT ,
+    `log_time` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    `log_message` TEXT,
+    PRIMARY KEY(`log_id`)
+);
+
+-- Section 1: `root` ---------------------------------------------------------------------------
+
+-- `letter` entity set 
+CREATE TABLE `letter` (
+    `id` INT,
+    `character` VARCHAR(2),
+    `default_accidentals` INT,
+    PRIMARY KEY (`id`),
+    CONSTRAINT `check_letter_character` CHECK (`character` IN ('A', 'B', 'C', 'D', 'E', 'F', 'G')),
+    CONSTRAINT `check_letter_id` CHECK (`id` BETWEEN 1 AND 7)
+);
+INSERT INTO `letter` (`id`, `character`, `default_accidentals`) VALUES 
+(1, 'C', 0),
+(2, 'D', 2),
+(3, 'E', 4),
+(4, 'F', -1),
+(5, 'G', 1),
+(6, 'A', 3),
+(7, 'B', 5);
+
+-- `accidental` entity set
+CREATE TABLE `accidental` (
+    `adjustment` INT NOT NULL, -- relative tuning with a letter in semitones
+    `type` ENUM('NATURAL', 'SHARP', 'FLAT', 'DOUBLE SHARP', 'DOUBLE FLAT'),
+    `symbol` ENUM('', '#', 'b', '##', 'bb'),
+    PRIMARY KEY (`adjustment`),
+    CONSTRAINT `check_adjustment_range` CHECK (`adjustment` BETWEEN -2 AND 2)
+);
+INSERT INTO `accidental` (`adjustment`, `type`, `symbol`) VALUES
+(0, 'NATURAL', ''),
+(1, 'SHARP', '#'),
+(-1, 'FLAT', 'b'),
+(2, 'DOUBLE SHARP', '##'),
+(-2, 'DOUBLE FLAT', 'bb');
+
+-- `root` weak entity set from `symbolize` many-many-one relation (e.g `letter`,`accidental` -> `root`)
+CREATE TABLE `root` (
+    `symbol` VARCHAR(5) NOT NULL,
+    `letter_id` INT,
+    `accidental_id` INT,
+    `default_accidentals` INT DEFAULT NULL,
+    PRIMARY KEY (`letter_id`, `accidental_id`),
+    FOREIGN KEY (`letter_id`) REFERENCES `letter`(`id`),
+    FOREIGN KEY (`accidental_id`) REFERENCES `accidental`(`adjustment`),
+    UNIQUE(`letter_id`, `accidental_id`)
+);
+
+
+-- Start transaction
+START TRANSACTION;
+
+-- Insert initial values into `root` table
+INSERT INTO `root` (`letter_id`, `accidental_id`, `symbol`, `default_accidentals`)
+SELECT `l`.`id`, `a`.`adjustment`, CONCAT(`l`.`character`, `a`.`symbol`), (`l`.`default_accidentals` + 7 * `a`.`adjustment`) AS `default_accidentals`
+FROM `letter` AS `l`
+CROSS JOIN `accidental` AS `a`;
+
+
+-- Update the `symbol` column for existing rows
+UPDATE `root`
+JOIN `letter` ON `root`.`letter_id` = `letter`.`id`
+JOIN `accidental` ON `root`.`accidental_id` = `accidental`.`adjustment`
+SET `root`.`symbol` = CONCAT(`letter`.`character`, `accidental`.`symbol`)
+WHERE `root`.`letter_id` = `letter`.`id` AND `root`.`accidental_id` = `accidental`.`adjustment`;
+
+INSERT INTO `log_table` (`log_time`, `log_message`) 
+VALUES (NOW(), 'Successfully added to `root`.`symbol`');
+
+-- Commit changes to `root`
+COMMIT;
+
+-- Section 2: `note` ---------------------------------------------------------------------------
+
+-- `octave` entity set 
+CREATE TABLE `octave` (
+    `id` INT,
+    PRIMARY KEY (`id`),
+    CONSTRAINT `check_octave_range` CHECK (`id` >= 0)
+);
+INSERT INTO `octave` (`id`) VALUES
+(0),
+(1),
+(2),
+(3),
+(4),
+(5),
+(6),
+(7),
+(8);
+
+-- `sound` entity set 
+CREATE TABLE `sound` (
+    `id` INT AUTO_INCREMENT,
+    `base_frequency` DOUBLE, -- in Hertz
+    PRIMARY KEY (`id`),
+    FOREIGN KEY(`id`) REFERENCES `letter`(`id`),
+    CONSTRAINT `check_base_frequency` CHECK (`base_frequency` > 0)
+);
+INSERT INTO `sound` (`base_frequency`) VALUES
+(16.352), -- C
+(18.354), -- D
+(20.601), -- E
+(21.827), -- F
+(24.500), -- G
+(27.500), -- A
+(30.868); -- B
+
+-- `note` weak entity set from `tuning` many-many-many-one relation (e.g. `root`,`sound`,`octave` -> `note`)
+CREATE TABLE `note` (
+    `root_letter` INT,
+    `root_accidental` INT,
+    `octave` INT,
+    `frequency` DOUBLE, -- in Hertz
+    PRIMARY KEY (`root_letter`, `root_accidental`, `octave`),
+    FOREIGN KEY (`root_letter`, `root_accidental`) REFERENCES `root`(`letter_id`, `accidental_id`),
+    FOREIGN KEY (`octave`) REFERENCES `octave`(`id`),
+    CONSTRAINT `check_valid_frequency` CHECK (`frequency` > 0),
+    UNIQUE(`root_letter`, `root_accidental`, `octave`)
+);
+
+-- Start transaction
+START TRANSACTION;
+-- Calculate frequency for each note considering base frequency and adjustments via semitone tuning relation
+INSERT INTO `note` (`root_letter`, `root_accidental`, `octave`, `frequency`)
+SELECT l.`id`, a.`adjustment`, o.`id`, ROUND((s.`base_frequency` * POWER(2, o.`id`) * POWER(2, a.`adjustment` / 12.0)), 3)
+FROM `root` AS r
+JOIN `accidental` AS a ON r.`accidental_id` = a.`adjustment`
+JOIN `letter` AS l ON r.`letter_id` = l.`id`
+JOIN `sound` AS s ON l.`id` = s.`id`
+CROSS JOIN `octave` AS o;
+
+INSERT INTO `log_table` (`log_time`, `log_message`) 
+VALUES (NOW(), 'Successfully calculated `note`.`frequency`');
+
+COMMIT;
+
+-- Section 3: Key signature ---------------------------------------------------------------------------
+
+-- entity set `circle_of_fifths`
+CREATE TABLE `circle_of_fifths` (
+    `accidentals` INT,
+    `adjusted_letters` VARCHAR(16),
+    `degree_order` VARCHAR(32),
+    PRIMARY KEY(`accidentals`) 
+    
+);
+INSERT INTO `circle_of_fifths` (`accidentals`, `adjusted_letters`, `degree_order`) VALUES
+(0, '', 'C.D.E.F.G.A.B'),
+(1, 'F', 'G.A.B.C.D.E.F'),
+(2, 'F.C', 'D.E.F.G.A.B.C'),
+(3, 'F.C.G', 'A.B.C.D.E.F.G'),
+(4, 'F.C.G.D', 'E.F.G.A.B.C.D'),
+(5, 'F.C.G.D.A', 'B.C.D.E.F.G.A'),
+(6, 'F.C.G.D.A.E', 'F.G.A.B.C.D.E'),
+(7, 'F.C.G.D.A.E.B', 'C.D.E.F.G.A.B'),
+(-1, 'B', 'F.G.A.B.C.D.E'),
+(-2, 'B.E', 'B.C.D.E.F.G.A'),
+(-3, 'B.E.A', 'E.F.G.A.B.C.D'),
+(-4, 'B.E.A.D', 'A.B.C.D.E.F.G'),
+(-5, 'B.E.A.D.G', 'D.E.F.G.A.B.C'),
+(-6, 'B.E.A.D.G.C', 'G.A.B.C.D.E.F'),
+(-7, 'B.E.A.D.G.C.F', 'C.D.E.F.G.A.B');
+
+-- entity set `key_signature`, default C major, will change in relation <- may be a weak entity set
+CREATE TABLE `key_signature` (
+    `degree` INT DEFAULT 0,
+    `letter` VARCHAR(1),
+    `accidental` INT DEFAULT 0,
+    PRIMARY KEY(`degree`, `letter`)
+    -- CONSTRAINT check_degree_valid CHECK (degree BETWEEN 1 AND 7)
+);
+INSERT INTO `key_signature` (`degree`, `letter`) VALUES 
+(1, 'C'),
+(2, 'D'),
+(3, 'E'),
+(4, 'F'),
+(5, 'G'),
+(6, 'A'),
+(7, 'B');
+
+
+-- Create procedure, ChangeKey(), as `change_key` relation (one-one-one-many relation between `root`, `circle_of_fifths`, `key_signature`, `log_table`)
+DELIMITER //
+
+CREATE PROCEDURE ChangeKey(IN root_symbol VARCHAR(255))
+BEGIN
+    DECLARE log_message VARCHAR(255);
+    DECLARE exit_resignal BOOLEAN DEFAULT FALSE;
+    DECLARE error_message TEXT DEFAULT NULL;
+
+    -- Declare handler for SQLEXCEPTION
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+    BEGIN
+        -- Get error message
+        SET error_message = CONCAT('Error occurred in ChangeKey procedure: ', 
+                                   CAST(ERROR_CODE() AS CHAR), ': ', 
+                                   CAST(ERROR_MESSAGE() AS CHAR));
+        INSERT INTO `log_table` (`log_time`, `log_message`) VALUES (NOW(), error_message);
+        
+        -- Set flag to trigger RESIGNAL if needed
+        SET exit_resignal = TRUE;
+        ROLLBACK;
+    END;
+
+    -- Log start of procedure
+    SET `log_message` = CONCAT('Starting ChangeKey procedure for root symbol: ', root_symbol);
+    INSERT INTO `log_table` (`log_time`, `log_message`) VALUES (NOW(), `log_message`);
+
+    -- Start transaction
+    START TRANSACTION;
+
+    -- Set all `key`.`degree` and `key`.`accidental` values to 0
+    UPDATE `key_signature` SET `degree` = 0, `accidental` = 0;
+
+    -- Check if the selected root is non-imaginary and get its default accidentals
+    SELECT `root`.`default_accidentals` INTO @root_default_accidentals
+    FROM `root`
+    WHERE `root`.`symbol` = root_symbol;
+
+    -- If @root_default_accidentals is not NULL, fetch corresponding tuple from `circle_of_fifths`
+    SELECT `adjusted_letters`, `degree_order` INTO @adjusted_letters, @degree_order
+    FROM `circle_of_fifths`
+    WHERE `accidentals` = @root_default_accidentals;
+
+    -- Initialize variables
+    SET @degree = (SELECT COUNT(*) FROM `key_signature`) + 1;
+
+    -- Update `key`.`accidental` based on `adjusted_letters`
+    SET @letter_list = REPLACE(@adjusted_letters, '.', ',');
+
+    UPDATE `key_signature` k
+    JOIN (
+        SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(@letter_list, ',', numbers.n), ',', -1) AS `letter`
+        FROM (
+            SELECT 1 + units.n + tens.n * 10 AS n
+            FROM (
+                SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL
+                SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9
+            ) AS units
+            CROSS JOIN (
+                SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL
+                SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9
+            ) AS tens
+        ) AS numbers
+        WHERE numbers.n <= 1 + (LENGTH(@adjusted_letters) - LENGTH(REPLACE(@adjusted_letters, '.', '')))
+    ) AS derived
+    ON k.`letter` = derived.`letter`
+    SET k.`accidental` = CASE
+        WHEN SIGN(@root_default_accidentals) > 0 THEN 1
+        WHEN SIGN(@root_default_accidentals) < 0 THEN -1
+        ELSE 0
+    END;
+
+    -- Update `key`.`degree` based on `degree_order` in reverse order
+    UPDATE `key_signature` k
+    JOIN (
+        SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(@degree_order, '.', numbers.n), '.', -1) AS `letter`, @degree := @degree - 1 AS `new_degree`
+        FROM (
+            SELECT 1 + units.n + tens.n * 10 AS n
+            FROM (
+                SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL
+                SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9
+            ) AS units
+            CROSS JOIN (
+                SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL
+                SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9
+            ) AS tens
+        ) AS numbers
+        WHERE numbers.n <= 1 + (LENGTH(@degree_order) - LENGTH(REPLACE(@degree_order, '.', '')))
+    ) AS derived
+    ON k.`letter` = derived.`letter`
+    SET k.`degree` = derived.`new_degree`;
+
+    -- Order degree orders for resulted key
+    ALTER TABLE `key_signature` ORDER BY `degree` ASC;
+
+    -- Update log
+    SET `log_message` = 'ChangeKey procedure completed';
+    INSERT INTO `log_table` (`log_time`, `log_message`) VALUES (NOW(), `log_message`);
+
+    -- Commit transaction
+    COMMIT;
+
+    -- Check if RESIGNAL is needed
+    IF exit_resignal THEN
+        RESIGNAL;
+    END IF;
+END //
+
+DELIMITER ;
+
+
+-- Section 4: Sequence ---------------------------------------------------------------------------- 
+
+-- entity set `sequence`
+CREATE TABLE `sequence` (
+    `id` INT AUTO_INCREMENT,
+    `structure` VARCHAR(255),
+    `key` VARCHAR(5) DEFAULT '',
+    `notes` VARCHAR(255) DEFAULT '' COLLATE utf8mb4_bin, -- collate important for case sensitivity
+    `semitones` VARCHAR(255) DEFAULT '',
+     PRIMARY KEY(`id`),
+     UNIQUE(`structure`, `key`)
+);
+-- Insert initial values into `sequence` table
+INSERT INTO `sequence` (`structure`, `key`) VALUES 
+('1.2.3.4.5.6.7', 'C'), 	-- C major scale
+('5.7.9.11', 'G'),    		-- Dominant 7 for G
+('1.2.3.4.5.6.7', 'Cb'),	-- Cb major scale
+('1.2.3.4.5.6.7', 'C#'),	-- C# major scale
+('#1.3.5', 'C'),			-- C major sharp tonic
+('1.b3.b5.bb7', 'C'),		-- C diminished 7
+('1.b3.5.9', 'C'),		 	-- Cmin9 chord
+('1.b3.b5.bb7', 'Cb'),		-- Cb diminished 7 (should not exist due to triple flat on 7th (Bbbb))
+('1', 'Cb'),				-- Root note in Cb, trivial
+('1.3.5', 'E'),				-- E major
+('invalid', 'C'),			-- invalid structure
+('1.3.5', 'X'),				-- invalid key
+('1.3.5', 'D#'),			-- invalid (imaginary) key
+('1.b3.5', 'A'),			-- A minor test adjacent C#b
+('1.b3.5.b7', 'E');			-- Emin7 chord
+
+-- Helper function for Transpose() (removes '#b' and 'b#' by cancelling opposites into empty string)
+DELIMITER //
+
+CREATE FUNCTION simplify_accidentals(accidentals VARCHAR(10)) 
+RETURNS VARCHAR(10)
+DETERMINISTIC
+NO SQL
+BEGIN
+    DECLARE result VARCHAR(10);
+    SET result = accidentals;
+    IF result LIKE '%#b%' OR result LIKE '%b#%' THEN
+        SET result = REPLACE(result, '#b', '');
+        SET result = REPLACE(result, 'b#', '');
+    END IF;
+    RETURN result;
+END//
+
+DELIMITER ;
+
+
+-- Create procedure, Transpose(), as `transpose` relation (many-many-many relation between `key_signature`, `sequence`, `log_table`)
+DELIMITER //
+
+CREATE PROCEDURE Transpose()
+BEGIN
+    DECLARE seq_done INT DEFAULT 0;
+    DECLARE seq_id INT;
+    DECLARE seq_structure VARCHAR(255);
+    DECLARE seq_key VARCHAR(5);
+    DECLARE seq_cursor CURSOR FOR
+        SELECT `id`, `structure`, `key`
+        FROM `sequence`;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET seq_done = 1;
+
+    -- Temporary table to store invalid tuples
+    CREATE TEMPORARY TABLE IF NOT EXISTS `temp_invalid` (
+        id INT PRIMARY KEY
+    );
+
+    -- Open cursor
+    OPEN seq_cursor;
+
+    read_loop: LOOP
+        FETCH seq_cursor INTO seq_id, seq_structure, seq_key;
+        IF seq_done THEN
+            LEAVE read_loop;
+        END IF;
+
+        -- Start transaction for this sequence entry
+        START TRANSACTION;
+
+        -- Log the start of processing for this sequence entry
+        INSERT INTO `log_table` (`log_time`, `log_message`) 
+        VALUES (NOW(), CONCAT('Processing sequence ID ', seq_id, ' for key ', seq_key));
+
+        -- Change the key signature to the current key of the sequence
+        CALL ChangeKey(seq_key);
+
+        -- Initialize variables for note construction
+        SET @structure_length = CHAR_LENGTH(seq_structure);
+        SET @i = 1;
+        SET @notes = '';
+        SET @degree = NULL;
+        SET @accidental = '';
+        SET @is_valid = 1;
+
+        -- Loop through each character in the structure
+        WHILE @i <= @structure_length DO
+            SET @char = SUBSTRING(seq_structure, @i, 1);
+
+            -- Check for double accidentals (## or bb)
+            IF SUBSTRING(seq_structure, @i, 2) IN ('##', 'bb') THEN
+                SET @accidental = SUBSTRING(seq_structure, @i, 2);
+                SET @i = @i + 2; -- Skip the next character as it is part of the double accidental
+
+                -- Ensure next character is a number
+                IF NOT SUBSTRING(seq_structure, @i, 1) BETWEEN '0' AND '9' THEN
+                    SET @is_valid = 0;
+                    SET @i = @structure_length + 1; -- Exit while loop
+                END IF;
+
+            ELSEIF @char IN ('#', 'b') THEN
+                SET @accidental = @char;
+                SET @i = @i + 1;
+
+                -- Ensure next character is a number
+                IF NOT SUBSTRING(seq_structure, @i, 1) BETWEEN '0' AND '9' THEN
+                    SET @is_valid = 0;
+                    SET @i = @structure_length + 1; -- Exit while loop
+                END IF;
+
+            ELSEIF @char BETWEEN '0' AND '9' THEN
+                SET @degree_start = @i;
+
+                -- Find the end of the degree (number)
+                WHILE @i <= @structure_length AND SUBSTRING(seq_structure, @i, 1) BETWEEN '0' AND '9' DO
+                    SET @i = @i + 1;
+                END WHILE;
+
+                -- Extract the degree from the structure
+                SET @degree_str = SUBSTRING(seq_structure, @degree_start, @i - @degree_start);
+                SET @degree = CONVERT(@degree_str, UNSIGNED);
+
+                -- Adjust degree to fit within 1 to 7
+                SET @degree = @degree % 7;
+                IF @degree = 0 THEN
+                    SET @degree = 7;
+                END IF;
+
+                -- Ensure next character is either a '.' or end of string
+                IF @i <= @structure_length AND SUBSTRING(seq_structure, @i, 1) != '.' THEN
+                    SET @is_valid = 0;
+                    SET @i = @structure_length + 1; -- Exit while loop
+                END IF;
+
+                -- Get corresponding note from key_signature
+                -- Adjust for leading accidentals
+                SET @note = (SELECT CONCAT(
+                                    (CASE
+                                        WHEN @accidental = '#' THEN CONCAT(ks.`letter`, '#')
+                                        WHEN @accidental = 'b' THEN CONCAT(ks.`letter`, 'b')
+                                        WHEN @accidental = '##' THEN CONCAT(ks.`letter`, '##')
+                                        WHEN @accidental = 'bb' THEN CONCAT(ks.`letter`, 'bb')
+                                        ELSE ks.`letter`
+                                    END),
+                                    IFNULL(NULLIF(a.`symbol`, ''), '')
+                             )
+                             FROM `key_signature` ks
+                             LEFT JOIN `accidental` a ON ks.`accidental` = a.`adjustment`
+                             WHERE ks.`degree` = @degree);
+
+                -- Append note to `notes` column
+                SET @notes = CONCAT(@notes, IF(CHAR_LENGTH(@notes) > 0, '.', ''), simplify_accidentals(@note));
+                SET @i = @i + 1; -- Move to next character after the degree
+                SET @accidental = ''; -- Reset accidental for next degree
+            ELSE
+                SET @is_valid = 0;
+                SET @i = @structure_length + 1; -- Exit while loop
+            END IF;
+        END WHILE;
+
+        -- If syntax is invalid, set notes to 'N/A'
+        IF @is_valid = 0 THEN
+            INSERT INTO `temp_invalid` (`id`) VALUES (seq_id);
+            SET @notes = 'N/A';
+        END IF;
+
+        -- Update the sequence's notes column if valid
+        IF @is_valid = 1 THEN
+            UPDATE `sequence`
+            SET `notes` = @notes
+            WHERE id = seq_id;
+        END IF;
+
+        -- Log the completion of processing for this sequence entry
+        INSERT INTO `log_table` (`log_time`, `log_message`) 
+        VALUES (NOW(), CONCAT('Processed sequence ID ', seq_id, ' with notes: ', @notes));
+
+        -- Commit the transaction for this entry
+        COMMIT;
+
+    END LOOP read_loop;
+
+    -- Close cursor
+    CLOSE seq_cursor;
+
+    -- Delete invalid rows identified by the temporary table
+    DELETE FROM `sequence`
+    WHERE `id` IN (SELECT `id` FROM `temp_invalid`)
+	OR `key` NOT IN (
+	'A', 'B', 'C', 'D', 'E', 'F', 'G',
+	'C#', 'F#',
+	'Ab', 'Bb', 'Cb', 'Db', 'Eb', 'Gb')
+    OR `notes` LIKE '%bbb%' OR `notes` LIKE '%###%'; -- need collate on `note` column to not delete note 'Bbb' 
+
+    -- Drop the temporary table
+    DROP TEMPORARY TABLE IF EXISTS `temp_invalid`;
+    
+	-- Log completion
+    INSERT INTO `log_table` (`log_time`, `log_message`) 
+    VALUES (NOW(), 'Transpose procedure completed');
+
+    -- Commit the outer transaction
+    COMMIT;
+END//
+
+DELIMITER ;
+
+-- Section 5: Intervals/Semitone tunings ---------------------------------------------------------------------------- 
+
+-- `interval` entity set
+CREATE TABLE `interval` (
+	`symbol` VARCHAR(8) DEFAULT '',
+    `size` INT DEFAULT 0,
+    PRIMARY KEY(`symbol`),
+    UNIQUE(`symbol`, `size`)
+);
+INSERT INTO `interval` (`symbol`, `size`) VALUES
+('1', 0),
+('#1', 1),
+('b2', 1),
+('2', 2),
+('b3', 3),
+('3', 4),
+('4', 5),
+('#4', 6),
+('b5', 6),
+('5', 7),
+('#5', 8),
+('b6', 8),
+('6', 9),
+('bb7', 9),
+('b7', 10),
+('7', 11),
+('8', 12),
+('b9', 13),
+('9', 14),
+('#9', 15),
+('11', 17),
+('#11', 18),
+('b13', 20),
+('13', 21);
+
+-- Create procedure, ProcessSequence(), as `process_sequence` relation (many-many-many relation between `interval`, `sequence`, `log_table`)
+DELIMITER //
+-- assumes no invalid rows in `sequence` --------------------------------------
+CREATE PROCEDURE ProcessSequence()
+BEGIN
+    DECLARE seq_done INT DEFAULT 0;
+    DECLARE seq_id INT;
+    DECLARE seq_structure VARCHAR(255);
+    DECLARE seq_key VARCHAR(5);
+    DECLARE interval_size INT;
+    DECLARE semitone_val VARCHAR(255);
+    DECLARE current_char CHAR(1);
+    DECLARE degree_start INT;
+    DECLARE degree_end INT;
+    DECLARE error_message TEXT;
+
+    DECLARE interval_cursor CURSOR FOR
+        SELECT `id`, `structure`, `key`
+        FROM `sequence`;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET seq_done = 1;
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+    BEGIN
+        SET error_message = CONCAT('Error in ProcessSequence procedure: ', 
+                                   CAST(ERROR_CODE() AS CHAR), ': ', 
+                                   CAST(ERROR_MESSAGE() AS CHAR));
+        INSERT INTO `log_table` (`log_time`, `log_message`) VALUES (NOW(), error_message);
+        ROLLBACK;
+    END;
+
+    -- Open cursor
+    OPEN interval_cursor;
+
+    read_loop: LOOP
+        FETCH interval_cursor INTO seq_id, seq_structure, seq_key;
+        IF seq_done THEN
+            LEAVE read_loop;
+        END IF;
+
+        -- Start transaction for this sequence entry
+        START TRANSACTION;
+
+        -- Log the start of processing for this sequence entry
+        INSERT INTO `log_table` (`log_time`, `log_message`) 
+        VALUES (NOW(), CONCAT('Started processing sequence ID ', seq_id, ' with structure "', seq_structure, '" and key "', seq_key, '"'));
+
+        -- Initialize variables
+        SET semitone_val = '';
+        SET @position = 1;
+
+        -- Process each part of the structure
+        WHILE @position <= LENGTH(seq_structure) DO
+            -- Extract current character
+            SET current_char = SUBSTRING(seq_structure, @position, 1);
+
+            -- If a '.' is encountered, move to the next character
+            IF current_char = '.' THEN
+                SET @position = @position + 1;
+                ITERATE read_loop; -- Use ITERATE to skip to the next iteration
+            END IF;
+
+            -- Extract the entire degree
+            SET degree_start = @position;
+            WHILE @position <= LENGTH(seq_structure) AND 
+                  (SUBSTRING(seq_structure, @position, 1) BETWEEN '0' AND '9' OR 
+                   SUBSTRING(seq_structure, @position, 1) IN ('#', 'b')) DO
+                SET @position = @position + 1;
+            END WHILE;
+
+            -- Get the degree symbol
+            SET degree_end = @position - 1;
+            SET @degree = SUBSTRING(seq_structure, degree_start, degree_end - degree_start + 1);
+
+            -- Find the interval size for this degree
+            SELECT `size` INTO interval_size
+            FROM `interval`
+            WHERE `symbol` = @degree;
+
+            -- Append the interval size to semitone_val
+            SET semitone_val = CONCAT(semitone_val, 
+                IF(CHAR_LENGTH(semitone_val) > 0, '.', ''), 
+                IFNULL(interval_size, '0')
+            );
+
+            -- Move to the next character
+            SET @position = @position + 1;
+        END WHILE;
+
+        -- Update the sequence table with the calculated semitones
+        UPDATE `sequence`
+        SET `semitones` = semitone_val
+        WHERE `id` = seq_id;
+
+        -- Log the update result
+        INSERT INTO `log_table` (`log_time`, `log_message`) 
+        VALUES (NOW(), CONCAT('Updated sequence ID ', seq_id, '. Structure: "', seq_structure, '". Calculated semitones: ', semitone_val));
+
+        -- Commit transaction
+        COMMIT;
+
+    END LOOP;
+
+    -- Close cursor
+    CLOSE interval_cursor;
+
+    -- Log completion
+    INSERT INTO `log_table` (`log_time`, `log_message`) 
+    VALUES (NOW(), 'ProcessSequence procedure completed');
+
+END //
+
+DELIMITER ;
+
+-- Section X: Selections ---------------------------------------------------------------------------
+SELECT * FROM `root`;
+SELECT * FROM `note`;
+-- SELECT * FROM `interval`;
+-- SELECT * FROM `circle_of_fifths`;
+
+-- SELECT * FROM `key_signature`;
+-- CALL ChangeKey('F#'); -- key change relation
+-- SELECT * FROM `key_signature`; -- verify key change
+SELECT * FROM `sequence`;
+
+CALL Transpose(); -- transpose relation
+SELECT * FROM `sequence`; -- verify transpose
+
+CALL ProcessSequence(); -- process_sequence relation (must be called after Transpose() as to clean up invalid tuples WIP***)
+SELECT * FROM `sequence`; -- verify process_sequence
+ 
+SELECT * FROM `log_table`;
+
+-- Section 6: RBAC (via MySQL 8.0 Command Line Client) -------------------------------------------------------------------------
+
+SHOW GRANTS FOR `musician`@`localhost`;
+
+
+-- Re-enable safe mode for the session
+-- SET SQL_SAFE_UPDATES = 1;
+
+-- -----------------------------------------------------------------------------------
+
+
+
